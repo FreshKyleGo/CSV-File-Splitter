@@ -199,6 +199,14 @@
         </div>
       </div>
       <div class="help" id="helpCategory">Filters on the "Case Category" column before splitting. Rows outside Benefit Request, Benefits and LOA Team Support, Employee Data Management, General HR, Health &amp; Safety, Learning &amp; Development, Leave of Absence, New Hire Journey, Offboarding, Payroll, Payroll Team Support, People, People Shared Services, Performance Management, Policy &amp; Compliance, Rewards, and Time Off and Attendance are dropped entirely — this is the same filter your dashboard applies.</div>
+
+      <div class="field-row" style="margin-top:10px">
+        <label for="stripTime">Date columns</label>
+        <div>
+          <label class="checkline"><input type="checkbox" id="stripTime" checked> Strip time — keep date only (e.g. 1/31/2026)</label>
+        </div>
+      </div>
+      <div class="help">Applies to every column whose header contains "date" — Case Creation Date, Case Resolved Date, etc. The time portion is removed entirely rather than just hidden by formatting.</div>
     </div>
     <div class="action-strip">
       <button class="btn btn-primary" id="btnSplit" disabled>Split file</button>
@@ -323,7 +331,11 @@ function parseFlexDate(s) {
   y = y.length === 2 ? '20' + y : y;
   const year = parseInt(y), month = parseInt(mo), day = parseInt(d);
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-  return { year, month }; // month is 1-indexed
+  return { year, month, day }; // month is 1-indexed
+}
+function stripTimeFromDateStr(s) {
+  const p = parseFlexDate(s);
+  return p ? `${p.month}/${p.day}/${p.year}` : s; // leave untouched if unparseable
 }
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -363,6 +375,18 @@ document.getElementById('btnSplit').addEventListener('click', () => {
   if (dataRows.length === 0) {
     setStatus('No data rows found after the detected header row.', 'err');
     return;
+  }
+
+  if (document.getElementById('stripTime').checked) {
+    const dateIdxs = [];
+    header.forEach((h, i) => { if (/date/i.test(h)) dateIdxs.push(i); });
+    // mutate a fresh copy of each row rather than the originals, in case the
+    // user re-runs a split with different settings without re-uploading
+    dataRows = dataRows.map(row => {
+      const copy = row.slice();
+      dateIdxs.forEach(i => { copy[i] = stripTimeFromDateStr(copy[i]); });
+      return copy;
+    });
   }
 
   let namedChunks = []; // [{ name, rows }]
