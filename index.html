@@ -90,6 +90,7 @@
 
   .field-row { display: grid; grid-template-columns: 160px 1fr; align-items: center; gap: 14px; margin-bottom: 14px; }
   .field-row label { font-size: 12.5px; font-weight: 600; color: var(--ink-soft); }
+  .checkline { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 400; color: var(--ink-soft); }
   .help { color: var(--muted); font-size: 11.5px; margin-top: 6px; line-height: 1.5; }
 
   input[type=number] {
@@ -190,6 +191,14 @@
       </div>
       <div class="help" id="helpEqual">Rows are split as evenly as possible across this many files. Each output file gets its own copy of the real header row, so you can open any one of them independently.</div>
       <div class="help" id="helpMonth" style="display:none">One file per calendar month, based on the selected date column. Rows with a blank or unreadable date go into a separate file rather than being dropped.</div>
+
+      <div class="field-row" style="margin-top:10px">
+        <label for="categoryFilter">Category filter</label>
+        <div>
+          <label class="checkline"><input type="checkbox" id="categoryFilter" checked> Only keep the 17 People-OPEX categories</label>
+        </div>
+      </div>
+      <div class="help" id="helpCategory">Filters on the "Case Category" column before splitting. Rows outside Benefit Request, Benefits and LOA Team Support, Employee Data Management, General HR, Health &amp; Safety, Learning &amp; Development, Leave of Absence, New Hire Journey, Offboarding, Payroll, Payroll Team Support, People, People Shared Services, Performance Management, Policy &amp; Compliance, Rewards, and Time Off and Attendance are dropped entirely — this is the same filter your dashboard applies.</div>
     </div>
     <div class="action-strip">
       <button class="btn btn-primary" id="btnSplit" disabled>Split file</button>
@@ -326,11 +335,30 @@ document.getElementById('splitMode').addEventListener('change', (e) => {
   document.getElementById('helpMonth').style.display = isMonth ? 'block' : 'none';
 });
 
+const KEEP_CATEGORIES = new Set([
+  'Benefit Request','Benefits and LOA Team Support','Employee Data Management','General HR',
+  'Health & Safety','Learning & Development','Leave of Absence','New Hire Journey','Offboarding',
+  'Payroll','Payroll Team Support','People','People Shared Services','Performance Management',
+  'Policy & Compliance','Rewards','Time Off and Attendance'
+]);
+
 document.getElementById('btnSplit').addEventListener('click', () => {
   if (!window._parsedRows) return;
   const mode = document.getElementById('splitMode').value;
   const header = window._header;
-  const dataRows = window._parsedRows.slice(window._headerIdx + 1);
+  let dataRows = window._parsedRows.slice(window._headerIdx + 1);
+  let droppedByCategory = 0;
+
+  if (document.getElementById('categoryFilter').checked) {
+    const catIdx = header.findIndex(h => /^case category$/i.test(String(h).trim()));
+    if (catIdx === -1) {
+      setStatus('Could not find a "Case Category" column — turn off the category filter to split without it.', 'err');
+      return;
+    }
+    const before = dataRows.length;
+    dataRows = dataRows.filter(row => KEEP_CATEGORIES.has(String(row[catIdx] || '').trim()));
+    droppedByCategory = before - dataRows.length;
+  }
 
   if (dataRows.length === 0) {
     setStatus('No data rows found after the detected header row.', 'err');
@@ -376,7 +404,8 @@ document.getElementById('btnSplit').addEventListener('click', () => {
       return `<tr><td>${escapeHtml(c.name)}.csv</td><td class="num">${c.rows.length.toLocaleString()}</td><td>${escapeHtml(preview)}${c.rows[0] && c.rows[0].length > 3 ? '…' : ''}</td></tr>`;
     }).join('');
     document.getElementById('resultsCard').style.display = 'block';
-    setStatus(`Split into ${namedChunks.length} files (header detected on row ${window._headerIdx + 1}).`, 'ok');
+    const catNote = droppedByCategory > 0 ? ` ${droppedByCategory.toLocaleString()} rows outside the 17 categories were dropped.` : '';
+    setStatus(`Split into ${namedChunks.length} files (header detected on row ${window._headerIdx + 1}).${catNote}`, 'ok');
   } catch (err) {
     setStatus('Something went wrong while splitting: ' + err.message, 'err');
   }
