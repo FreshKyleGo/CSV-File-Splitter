@@ -180,6 +180,7 @@
         <select id="splitMode">
           <option value="equal">Equal-sized files</option>
           <option value="month">By month</option>
+          <option value="none">Single file (no split)</option>
         </select>
       </div>
       <div class="field-row" id="rowEqualCount">
@@ -192,6 +193,7 @@
       </div>
       <div class="help" id="helpEqual">Rows are split as evenly as possible across this many files. Each output file gets its own copy of the real header row, so you can open any one of them independently.</div>
       <div class="help" id="helpMonth" style="display:none">One file per calendar month, based on the selected date column. Rows with a blank or unreadable date go into a separate file rather than being dropped.</div>
+      <div class="help" id="helpNone" style="display:none">No splitting — you get one CSV back. Useful when all you want is the category filter or a format conversion applied to the whole file.</div>
 
       <div class="field-row" style="margin-top:10px">
         <label for="categoryFilter">Category filter</label>
@@ -202,12 +204,20 @@
       <div class="help" id="helpCategory">Filters on the "Case Category" column before splitting. Rows outside Benefit Request, Benefits and LOA Team Support, Employee Data Management, General HR, Health &amp; Safety, Learning &amp; Development, Leave of Absence, New Hire Journey, Offboarding, Payroll, Payroll Team Support, People, People Shared Services, Performance Management, Policy &amp; Compliance, Rewards, and Time Off and Attendance are dropped entirely — this is the same filter your dashboard applies.</div>
 
       <div class="field-row" style="margin-top:10px">
+        <label for="refFormat">Output format</label>
+        <div>
+          <label class="checkline"><input type="checkbox" id="refFormat"> Match the reference layout (25 columns)</label>
+        </div>
+      </div>
+      <div class="help" id="helpRefFormat">Rewrites the file into the same shape as <strong>HR-266126_CLEAN_for_Sheets.csv</strong>, so a new export can be stacked straight onto the old one. Columns are reordered to the reference order; <strong>Case ID</strong> is folded into <strong>Case</strong> ("HR-302263: subject"); <strong>Case Creator - Job Family</strong> becomes <strong>Case Creator - Job Fam</strong>; <strong>Time to final resolution</strong> carries the resolved/cancelled datetime rather than minutes; dates are written as <span style="font-family:var(--mono)">M/D/YY H:MM</span>, month as <span style="font-family:var(--mono)">MM/YYYY</span>, and hour columns as whole numbers. Columns the reference doesn't have are dropped, columns it has but your file doesn't are left blank, and every field is quoted.</div>
+
+      <div class="field-row" style="margin-top:10px">
         <label for="stripTime">Date columns</label>
         <div>
           <label class="checkline"><input type="checkbox" id="stripTime" checked> Strip time — keep date only (e.g. 1/31/2026)</label>
         </div>
       </div>
-      <div class="help">Applies to every column whose header contains "date" — Case Creation Date, Case Resolved Date, etc. The time portion is removed entirely rather than just hidden by formatting.</div>
+      <div class="help" id="helpStripTime">Ignored when "Match the reference layout" is on, since that format defines its own date style. Otherwise applies to every column whose header contains "date" — Case Creation Date, Case Resolved Date, etc. The time portion is removed entirely rather than just hidden by formatting.</div>
     </div>
     <div class="action-strip">
       <button class="btn btn-primary" id="btnSplit" disabled>Split file</button>
@@ -218,7 +228,7 @@
 
   <div class="card" id="resultsCard" style="display:none">
     <div class="card-h"><div class="dot"></div><h2>3. Download your files</h2></div>
-    <div class="card-sub">Detected header on row <span id="headerRowNum"></span>. Each file below includes that header plus its share of data rows.</div>
+    <div class="card-sub">Detected header on row <span id="headerRowNum"></span>. Each file below includes a header row plus its share of data rows.</div>
     <div class="card-b" style="padding-top:0">
       <table class="splits" id="splitsTable">
         <thead><tr><th>File</th><th class="num">Rows</th><th>Preview (first data row)</th></tr></thead>
@@ -319,6 +329,9 @@ function handleFile(file) {
             if (typeof v === 'number') {
               const addr = XLSX.utils.encode_cell({ r, c: i });
               const cell = sheet[addr];
+              // cell.w is Excel's own rendering and already includes the time
+              // of day when the cell has one, so it loses nothing and stays
+              // faithful to the source file's format.
               rows[r][i] = (cell && cell.w) ? cell.w : excelSerialToMDY(v);
             }
           });
@@ -370,7 +383,8 @@ function excelSerialToMDY(serial) {
   const day = dateInfo.getUTCDate();
   const year = dateInfo.getUTCFullYear();
   if (timeFraction > 0.0001) {
-    let totalMinutes = Math.round(timeFraction * 24 * 60);
+    // Truncate, matching how Excel renders 14:12:58 as 14:12.
+    let totalMinutes = Math.floor(timeFraction * 24 * 60 + 1e-6);
     const hours = Math.floor(totalMinutes / 60);
     const minutes = totalMinutes % 60;
     return `${month}/${day}/${year} ${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}`;
@@ -402,6 +416,35 @@ function setStatus(msg, cls) {
 // preamble rows (title, "Include Internal Notes,No", etc.) have far fewer
 // populated cells than the real header + data rows, so they get skipped.
 function detectHeaderRow(rows) {
+  // First pass: a header row is a wide run of *labels* — text that isn't a
+  // number or a date. Report preamble rows ("Case Created On or After,
+  // 1/1/2026") are only one or two cells wide, and data rows always carry a
+  // handful of numbers and timestamps, so the real header scores highest.
+  // (The older "most common cell count" rule broke on exports where blank
+  // optional fields made data rows narrower than the header.)
+  const isPopulated = c => c !== null && c !== undefined && String(c).trim() !== '';
+  const looksLikeLabel = v => {
+    if (!isPopulated(v)) return false;
+    if (typeof v === 'number') return false;
+    const str = String(v).trim();
+    if (/^-?[\d,]+(\.\d+)?$/.test(str)) return false;   // plain numbers
+    if (toDateParts(str)) return false;                    // dates / timestamps
+    return true;
+  };
+  const limit = Math.min(rows.length, 30);   // headers always sit near the top
+  let best = -1, bestScore = 1;
+  for (let i = 0; i < limit; i++) {
+    const score = rows[i].filter(looksLikeLabel).length;
+    if (score <= bestScore) continue;
+    // a real header is followed by data of comparable width
+    const next = rows[i + 1] || [];
+    if (next.filter(isPopulated).length < Math.ceil(score * 0.5)) continue;
+    bestScore = score; best = i;
+  }
+  if (best >= 0) return best;
+
+  // Fallback: the original heuristic — first row whose populated-cell count
+  // matches the most common count in the file.
   const counts = rows.map(r => r.filter(c => c !== null && c !== undefined && String(c).trim() !== '').length);
   const freq = {};
   counts.forEach(c => { if (c > 1) freq[c] = (freq[c] || 0) + 1; }); // ignore 0/1-cell rows entirely
@@ -430,14 +473,211 @@ function stripTimeFromDateStr(s) {
   const p = parseFlexDate(s);
   return p ? `${p.month}/${p.day}/${p.year}` : s; // leave untouched if unparseable
 }
+/* ------------------------------------------------------------------
+   Reference format — the layout of HR-266126_CLEAN_for_Sheets.csv.
+   Converting to this lets a fresh export be appended to the old one
+   without the columns drifting out of line.
+   ------------------------------------------------------------------ */
+const TEMPLATE_COLUMNS = [
+  'Case', 'Case Status', 'Case Category', 'Case Type', 'Case Resolved Time Stamp', 'Created Moment',
+  'Service Team', 'Case Assignee', 'Case Creator Email', "Case Assignee's Team/Squad",
+  'Case Assignee Sup Org Level 06', 'Time to final resolution', 'Case Creation Date',
+  'Case Created Month', 'Real Time to First Response (Hours)', 'Time to First Response SLA Result',
+  'Last Resolved or Cancelled Date',
+  'Real Time to First Resolution/Cancellation in hours (including times out of work schedule)',
+  'Time to Resolve SLA Result', 'Case Email From', 'Case Creator', 'Case Creator - Job Fam',
+  'Case Creator - Company', 'Time to Resolve SLA Target', 'Passed or failed'
+];
+
+const TEMPLATE_DATE_COLS = new Set([
+  'Case Resolved Time Stamp', 'Created Moment', 'Time to final resolution',
+  'Case Creation Date', 'Last Resolved or Cancelled Date'
+]);
+
+const TEMPLATE_INT_COLS = new Set([
+  'Real Time to First Response (Hours)', 'Time to Resolve SLA Target',
+  'Real Time to First Resolution/Cancellation in hours (including times out of work schedule)'
+]);
+
+// Header spellings that differ between exports but mean the same column.
+// Keyed by the normalised reference name.
+const TEMPLATE_ALIASES = {
+  'case creator - job fam': ['case creator - job family', 'case creator job family'],
+  'time to final resolution': ['time to final resolution (minutes)', 'time to final resolution (mins)'],
+  'case creator - company': ['case creator company'],
+  "case assignee's team/squad": ['case assignee team/squad', 'case assignees team/squad'],
+  'case assignee sup org level 06': ['case assignee sup org level 6']
+};
+
+function normHeader(h) {
+  return String(h === null || h === undefined ? '' : h).trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Normalises anything date-ish into plain parts: a JS Date, a raw Excel serial
+// number, "8/4/26 14:12", "8/4/2026", "8/4/26 2:12 PM" or "2026-08-04 14:12:58".
+// Returns null when there's nothing readable, so blanks stay blank.
+// allowSerial defaults to true; pass false for columns that may hold a bare
+// duration (e.g. "Time to final resolution (Minutes)" = 853), which would
+// otherwise be read as an Excel date serial and land in the year 2002.
+function toDateParts(v, allowSerial) {
+  if (allowSerial === undefined) allowSerial = true;
+  if (v === null || v === undefined || v === '') return null;
+
+  if (v instanceof Date && !isNaN(v)) {
+    return { year: v.getFullYear(), month: v.getMonth() + 1, day: v.getDate(),
+             hour: v.getHours(), minute: v.getMinutes(),
+             hasTime: !(v.getHours() === 0 && v.getMinutes() === 0) };
+  }
+
+  // Excel serials: day 0 is 1899-12-30, and the fractional part is time of day.
+  // Rounding to the nearest minute first avoids 13:59:59.9-style artefacts.
+  if (typeof v === 'number' && isFinite(v) && v > 0) {
+    if (!allowSerial) return null;
+    // Truncate rather than round: Excel renders 14:12:58 as 14:12, and the
+    // reference file follows suit. The epsilon absorbs binary-float drift.
+    const totalMin = Math.floor(v * 1440 + 1e-6);
+    const days = Math.floor(totalMin / 1440);
+    const mins = totalMin - days * 1440;
+    const d = new Date((days - 25569) * 86400000);
+    return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate(),
+             hour: Math.floor(mins / 60), minute: mins % 60, hasTime: mins > 0 };
+  }
+
+  const str = String(v).trim();
+  if (!str) return null;
+
+  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?/);
+  if (m) {
+    return { year: +m[1], month: +m[2], day: +m[3],
+             hour: m[4] === undefined ? 0 : +m[4], minute: m[5] === undefined ? 0 : +m[5],
+             hasTime: m[4] !== undefined };
+  }
+
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ ,]+(\d{1,2}):(\d{2})(?::\d{2})?(?:\s*([AaPp])[Mm]?)?)?/);
+  if (!m) return null;
+  const month = +m[1], day = +m[2];
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  let year = +m[3];
+  if (m[3].length === 2) year += 2000;
+  let hour = m[4] === undefined ? 0 : +m[4];
+  if (m[6]) {                                    // 12-hour clock with AM/PM
+    const pm = /p/i.test(m[6]);
+    if (hour === 12) hour = pm ? 12 : 0;
+    else if (pm) hour += 12;
+  }
+  return { year, month, day, hour, minute: m[5] === undefined ? 0 : +m[5],
+           hasTime: m[4] !== undefined };
+}
+
+// M/D/YY H:MM — no leading zeros on the date or hour, two-digit minutes,
+// two-digit year, exactly as the reference file writes them.
+function fmtRefDateTime(p) {
+  if (!p) return '';
+  const yy = String(p.year).slice(-2);
+  return `${p.month}/${p.day}/${yy} ${p.hour}:${String(p.minute).padStart(2, '0')}`;
+}
+function fmtRefMonth(p) { return p ? `${String(p.month).padStart(2, '0')}/${p.year}` : ''; }
+function fmtRefInt(v) {
+  if (v === null || v === undefined || String(v).trim() === '') return '';
+  const n = Number(String(v).replace(/,/g, '').trim());
+  return isFinite(n) ? String(Math.round(n)) : String(v).trim();
+}
+function refText(v) { return v === null || v === undefined ? '' : String(v).trim(); }
+
+// Rebuilds header + rows in the reference layout. Returns the columns that had
+// to be left blank and the source columns that were dropped, so the UI can say
+// so out loud rather than silently losing data.
+function convertToTemplate(header, rows) {
+  const byName = {};
+  header.forEach((h, i) => { const k = normHeader(h); if (byName[k] === undefined) byName[k] = i; });
+
+  const srcIdx = {};
+  TEMPLATE_COLUMNS.forEach(col => {
+    const keys = [normHeader(col)].concat(TEMPLATE_ALIASES[normHeader(col)] || []);
+    let found = -1;
+    for (const k of keys) { if (byName[k] !== undefined) { found = byName[k]; break; } }
+    srcIdx[col] = found;
+  });
+
+  const caseIdIdx  = byName['case id'] === undefined ? -1 : byName['case id'];
+  const lastResIdx = srcIdx['Last Resolved or Cancelled Date'];
+  const at = (row, i) => (i >= 0 ? row[i] : '');
+
+  const outRows = rows.map(row => TEMPLATE_COLUMNS.map(col => {
+    switch (col) {
+      case 'Case': {
+        // The reference carries a single "Case" column shaped
+        // "HR-302263: subject", so a separate Case ID column is folded in
+        // rather than kept beside it.
+        const id = refText(at(row, caseIdIdx));
+        const subject = refText(at(row, srcIdx['Case']));
+        if (!subject) return id;
+        if (id && subject.indexOf(id) !== 0) return id + ': ' + subject;
+        return subject;
+      }
+      case 'Time to final resolution': {
+        // In the reference this column holds the resolved/cancelled datetime,
+        // not a duration — so a "(Minutes)" value gets replaced by that stamp.
+        const own = toDateParts(at(row, srcIdx[col]), false);
+        return fmtRefDateTime(own || toDateParts(at(row, lastResIdx)));
+      }
+      case 'Case Resolved Time Stamp': {
+        // Blank means never resolved and must stay blank. Some exports store
+        // this date-only at midnight, so prefer the full timestamp when there is one.
+        const raw = at(row, srcIdx[col]);
+        if (raw === '' || raw === null || raw === undefined) return '';
+        const own = toDateParts(raw);
+        if (own && own.hasTime) return fmtRefDateTime(own);
+        return fmtRefDateTime(toDateParts(at(row, lastResIdx)) || own);
+      }
+      case 'Case Created Month': {
+        const raw = refText(at(row, srcIdx[col]));
+        if (/^\d{1,2}\/\d{4}$/.test(raw)) return raw.padStart(7, '0');
+        return fmtRefMonth(toDateParts(raw)
+                        || toDateParts(at(row, srcIdx['Case Creation Date']))
+                        || toDateParts(at(row, srcIdx['Created Moment'])));
+      }
+      default:
+        if (TEMPLATE_DATE_COLS.has(col)) return fmtRefDateTime(toDateParts(at(row, srcIdx[col])));
+        if (TEMPLATE_INT_COLS.has(col))  return fmtRefInt(at(row, srcIdx[col]));
+        return refText(at(row, srcIdx[col]));
+    }
+  }));
+
+  // "Case" and "Time to final resolution" are always derivable, so they never
+  // count as missing even when no column of that exact name exists.
+  const derived = new Set(['Case', 'Time to final resolution']);
+  const missing = TEMPLATE_COLUMNS.filter(c => srcIdx[c] === -1 && !derived.has(c));
+  const used = new Set(TEMPLATE_COLUMNS.map(c => srcIdx[c]).filter(i => i >= 0));
+  const dropped = header
+    .map((h, i) => ({ h: refText(h), i }))
+    .filter(o => o.h && o.i !== caseIdIdx && !used.has(o.i))   // Case ID is folded in, not lost
+    .map(o => o.h);
+
+  return { header: TEMPLATE_COLUMNS.slice(), rows: outRows, missing, dropped };
+}
+
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 document.getElementById('splitMode').addEventListener('change', (e) => {
-  const isMonth = e.target.value === 'month';
-  document.getElementById('rowEqualCount').style.display = isMonth ? 'none' : 'grid';
+  const mode = e.target.value;
+  const isMonth = mode === 'month';
+  const isNone = mode === 'none';
+  document.getElementById('rowEqualCount').style.display = (isMonth || isNone) ? 'none' : 'grid';
   document.getElementById('rowDateCol').style.display = isMonth ? 'grid' : 'none';
-  document.getElementById('helpEqual').style.display = isMonth ? 'none' : 'block';
+  document.getElementById('helpEqual').style.display = (isMonth || isNone) ? 'none' : 'block';
   document.getElementById('helpMonth').style.display = isMonth ? 'block' : 'none';
+  document.getElementById('helpNone').style.display = isNone ? 'block' : 'none';
+  document.getElementById('btnSplit').textContent = isNone ? 'Convert file' : 'Split file';
+});
+
+// Reference formatting defines its own date style, so strip-time would only
+// fight with it — grey it out while conversion is on.
+document.getElementById('refFormat').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  const strip = document.getElementById('stripTime');
+  strip.disabled = on;
+  document.getElementById('helpStripTime').style.opacity = on ? 0.5 : 1;
 });
 
 const KEEP_CATEGORIES = new Set([
@@ -450,9 +690,27 @@ const KEEP_CATEGORIES = new Set([
 document.getElementById('btnSplit').addEventListener('click', () => {
   if (!window._parsedRows) return;
   const mode = document.getElementById('splitMode').value;
-  const header = window._header;
+  const convert = document.getElementById('refFormat').checked;
+  let header = window._header;
   let dataRows = window._parsedRows.slice(window._headerIdx + 1);
   let droppedByCategory = 0;
+  let convertNote = '';
+
+  // Reformat first so everything downstream — the category filter, month
+  // bucketing, the preview — works on the reference column names.
+  if (convert) {
+    try {
+      const res = convertToTemplate(header, dataRows);
+      header = res.header;
+      dataRows = res.rows;
+      convertNote = ` Reformatted to the ${res.header.length}-column reference layout.`;
+      if (res.dropped.length) convertNote += ` Dropped: ${res.dropped.join(', ')}.`;
+      if (res.missing.length) convertNote += ` Left blank (missing from source): ${res.missing.join(', ')}.`;
+    } catch (err) {
+      setStatus('Could not convert to the reference layout: ' + err.message, 'err');
+      return;
+    }
+  }
 
   if (document.getElementById('categoryFilter').checked) {
     const catIdx = header.findIndex(h => /^case category$/i.test(String(h).trim()));
@@ -470,7 +728,7 @@ document.getElementById('btnSplit').addEventListener('click', () => {
     return;
   }
 
-  if (document.getElementById('stripTime').checked) {
+  if (!convert && document.getElementById('stripTime').checked) {
     const dateIdxs = [];
     header.forEach((h, i) => { if (/date/i.test(h)) dateIdxs.push(i); });
     // mutate a fresh copy of each row rather than the originals, in case the
@@ -485,7 +743,9 @@ document.getElementById('btnSplit').addEventListener('click', () => {
   let namedChunks = []; // [{ name, rows }]
 
   try {
-    if (mode === 'equal') {
+    if (mode === 'none') {
+      namedChunks.push({ name: convert ? `${fileBaseName}_CLEAN_for_Sheets` : `${fileBaseName}_clean`, rows: dataRows });
+    } else if (mode === 'equal') {
       const n = Math.max(2, Math.min(30, parseInt(document.getElementById('splitCount').value) || 8));
       const perFile = Math.ceil(dataRows.length / n);
       for (let i = 0; i < n; i++) {
@@ -493,7 +753,19 @@ document.getElementById('btnSplit').addEventListener('click', () => {
         if (slice.length) namedChunks.push({ name: `${fileBaseName}_part${namedChunks.length + 1}`, rows: slice });
       }
     } else {
-      const colIdx = parseInt(document.getElementById('dateColSelect').value);
+      // The dropdown was built from the original headers, so after a
+      // conversion its index no longer points at the same column — re-find it
+      // by name, then fall back to the nearest reference equivalent.
+      let colIdx = parseInt(document.getElementById('dateColSelect').value);
+      if (convert) {
+        const sel = document.getElementById('dateColSelect');
+        const chosen = normHeader(sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text : '');
+        let ni = header.findIndex(h => normHeader(h) === chosen);
+        if (ni === -1) ni = header.findIndex(h => (TEMPLATE_ALIASES[normHeader(h)] || []).indexOf(chosen) >= 0);
+        if (ni === -1 && /resolved|cancel/.test(chosen)) ni = header.indexOf('Last Resolved or Cancelled Date');
+        if (ni === -1) ni = header.indexOf('Case Creation Date');
+        colIdx = ni;
+      }
       const buckets = {}; // 'YYYY-MM' -> rows[]
       const noDate = [];
       dataRows.forEach(row => {
@@ -513,6 +785,9 @@ document.getElementById('btnSplit').addEventListener('click', () => {
 
     window._splitChunks = namedChunks;
     window._splitHeader = header;
+    window._refFormatted = convert;
+    document.getElementById('btnDownloadZip').textContent =
+      namedChunks.length === 1 ? 'Download CSV' : 'Download all as .zip';
 
     document.getElementById('headerRowNum').textContent = window._headerIdx + 1;
     const body = document.getElementById('splitsBody');
@@ -522,7 +797,11 @@ document.getElementById('btnSplit').addEventListener('click', () => {
     }).join('');
     document.getElementById('resultsCard').style.display = 'block';
     const catNote = droppedByCategory > 0 ? ` ${droppedByCategory.toLocaleString()} rows outside the 17 categories were dropped.` : '';
-    setStatus(`Split into ${namedChunks.length} files (header detected on row ${window._headerIdx + 1}).${catNote}`, 'ok');
+    const headNote = ` (header detected on row ${window._headerIdx + 1})`;
+    const lead = namedChunks.length === 1
+      ? `Prepared 1 file of ${dataRows.length.toLocaleString()} rows${headNote}.`
+      : `Split into ${namedChunks.length} files${headNote}.`;
+    setStatus(`${lead}${catNote}${convertNote}`, 'ok');
   } catch (err) {
     setStatus('Something went wrong while splitting: ' + err.message, 'err');
   }
@@ -530,12 +809,32 @@ document.getElementById('btnSplit').addEventListener('click', () => {
 
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
 document.getElementById('btnDownloadZip').addEventListener('click', async () => {
   if (!window._splitChunks) return;
+  // The reference file quotes every field, so match that when converting.
+  // The reference file quotes every field and ends lines with a bare LF,
+  // so match both exactly when converting.
+  const csvOpts = window._refFormatted ? { quotes: true, newline: '\n' } : {};
+
+  if (window._splitChunks.length === 1) {
+    const c = window._splitChunks[0];
+    const csv = Papa.unparse([window._splitHeader, ...c.rows], csvOpts);
+    saveBlob(new Blob([csv], { type: 'text/csv;charset=utf-8;' }), `${c.name}.csv`);
+    setStatus(`Downloaded ${c.name}.csv (${c.rows.length.toLocaleString()} rows).`, 'ok');
+    return;
+  }
+
   setStatus('Building zip…');
   const zip = new JSZip();
   window._splitChunks.forEach(c => {
-    const csv = Papa.unparse([window._splitHeader, ...c.rows]);
+    const csv = Papa.unparse([window._splitHeader, ...c.rows], csvOpts);
     zip.file(`${c.name}.csv`, csv);
   });
   const blob = await zip.generateAsync({ type: 'blob' });
@@ -551,7 +850,12 @@ document.getElementById('btnReset').addEventListener('click', () => {
   window._parsedRows = null;
   window._header = null;
   window._splitChunks = null;
+  window._refFormatted = false;
   fileInput.value = '';
+  document.getElementById('refFormat').checked = false;
+  document.getElementById('stripTime').disabled = false;
+  document.getElementById('helpStripTime').style.opacity = 1;
+  document.getElementById('btnDownloadZip').textContent = 'Download all as .zip';
   document.getElementById('fileInfo').classList.remove('show');
   document.getElementById('btnSplit').disabled = true;
   document.getElementById('resultsCard').style.display = 'none';
