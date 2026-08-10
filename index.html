@@ -7,6 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   :root{
     --bg:#f4f6ef;
@@ -159,10 +160,10 @@
     <div class="card-b">
       <div class="drop-zone" id="dropZone">
         <div class="icon">📄</div>
-        <div class="main-text">Click to browse, or drag a CSV file here</div>
-        <div class="sub-text">Works with raw exports that have a metadata preamble before the real headers</div>
+        <div class="main-text">Click to browse, or drag a CSV or Excel file here</div>
+        <div class="sub-text">Works with raw exports that have a metadata preamble before the real headers, and with malformed Excel files (bad sheet dimensions, etc.)</div>
       </div>
-      <input type="file" id="fileInput" accept=".csv" />
+      <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" />
       <div class="file-info" id="fileInfo">
         <span>✓</span>
         <span class="fname" id="fileName"></span>
@@ -248,41 +249,133 @@ dropZone.addEventListener('drop', e => {
 fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
 
 function handleFile(file) {
-  if (!file.name.toLowerCase().endsWith('.csv')) {
-    setStatus('Please choose a .csv file.', 'err');
+  const name = file.name.toLowerCase();
+  const isExcel = name.endsWith('.xlsx') || name.endsWith('.xls');
+  const isCsv = name.endsWith('.csv');
+  if (!isExcel && !isCsv) {
+    setStatus('Please choose a .csv, .xlsx, or .xls file.', 'err');
     return;
   }
-  fileBaseName = file.name.replace(/\.csv$/i, '');
-  const reader = new FileReader();
-  reader.onload = e => {
-    rawText = e.target.result;
-    const lineCount = rawText.split('\n').length;
-    document.getElementById('fileName').textContent = file.name;
-    document.getElementById('fileMeta').textContent = `· ${(file.size/1024/1024).toFixed(1)} MB · ~${lineCount.toLocaleString()} lines`;
-    document.getElementById('fileInfo').classList.add('show');
-    document.getElementById('resultsCard').style.display = 'none';
-    setStatus('Detecting columns…');
+  fileBaseName = file.name.replace(/\.(csv|xlsx|xls)$/i, '');
 
-    Papa.parse(rawText, {
-      complete: (res) => {
-        try {
-          const rows = res.data.filter(r => r.length > 1 || (r.length === 1 && r[0] !== ''));
-          const headerIdx = detectHeaderRow(rows);
-          window._parsedRows = rows;
-          window._headerIdx = headerIdx;
-          window._header = rows[headerIdx];
-          populateDateColumns(window._header);
-          document.getElementById('btnSplit').disabled = false;
-          setStatus(`Detected header on row ${headerIdx + 1}. Ready to split.`, 'ok');
-        } catch (err) {
-          setStatus('Could not read this file: ' + err.message, 'err');
+  document.getElementById('fileInfo').classList.add('show');
+  document.getElementById('fileName').textContent = file.name;
+  document.getElementById('resultsCard').style.display = 'none';
+  setStatus('Reading file…');
+
+  if (isCsv) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      rawText = e.target.result;
+      const lineCount = rawText.split('\n').length;
+      document.getElementById('fileMeta').textContent = `· ${(file.size/1024/1024).toFixed(1)} MB · ~${lineCount.toLocaleString()} lines`;
+      setStatus('Detecting columns…');
+      Papa.parse(rawText, {
+        complete: (res) => {
+          try {
+            const rows = res.data.filter(r => r.length > 1 || (r.length === 1 && r[0] !== ''));
+            finishLoadingRows(rows);
+          } catch (err) {
+            setStatus('Could not read this file: ' + err.message, 'err');
+          }
+        },
+        error: (err) => setStatus('Parse error: ' + err.message, 'err')
+      });
+    };
+    reader.onerror = () => setStatus('Could not read that file.', 'err');
+    reader.readAsText(file);
+  } else {
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array', raw: true });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+
+        // Some exports declare a bogus sheet dimension (e.g. "A1" when the
+        // real data spans thousands of rows/columns) — sheet_to_json trusts
+        // that declared range, so we recompute the real one from the actual
+        // cell addresses present before parsing, same fix as we did by hand
+        // on the broken August export.
+        fixSheetRange(sheet);
+
+        let rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: '' });
+        rows = rows.filter(r => r.length > 1 || (r.length === 1 && r[0] !== ''));
+
+        document.getElementById('fileMeta').textContent = `· ${(file.size/1024/1024).toFixed(1)} MB · ~${rows.length.toLocaleString()} rows (sheet: ${wb.SheetNames[0]})`;
+        setStatus('Detecting columns…');
+
+        const headerIdx = detectHeaderRow(rows);
+        const header = rows[headerIdx];
+        // Excel stores dates as serial numbers under the hood no matter how
+        // they're displayed. Rather than reformatting them ourselves, pull
+        // the cell's own pre-formatted text (the "w" property) straight from
+        // the sheet — that respects whatever date format the source file
+        // actually used, so it's more faithful than a fixed M/D/YYYY guess.
+        const dateIdxs = [];
+        header.forEach((h, i) => { if (/date/i.test(h)) dateIdxs.push(i); });
+        for (let r = headerIdx + 1; r < rows.length; r++) {
+          dateIdxs.forEach(i => {
+            const v = rows[r][i];
+            if (typeof v === 'number') {
+              const addr = XLSX.utils.encode_cell({ r, c: i });
+              const cell = sheet[addr];
+              rows[r][i] = (cell && cell.w) ? cell.w : excelSerialToMDY(v);
+            }
+          });
         }
-      },
-      error: (err) => setStatus('Parse error: ' + err.message, 'err')
-    });
-  };
-  reader.onerror = () => setStatus('Could not read that file.', 'err');
-  reader.readAsText(file);
+
+        finishLoadingRows(rows);
+      } catch (err) {
+        setStatus('Could not read this Excel file: ' + err.message, 'err');
+      }
+    };
+    reader.onerror = () => setStatus('Could not read that file.', 'err');
+    reader.readAsArrayBuffer(file);
+  }
+}
+
+// Recomputes the sheet's !ref (used range) from the actual cell addresses
+// present, ignoring whatever range the file itself declared. Needed because
+// some exports declare a dimension far smaller than their real content,
+// which makes sheet_to_json silently truncate to almost nothing.
+function fixSheetRange(sheet) {
+  let maxRow = 0, maxCol = 0;
+  Object.keys(sheet).forEach(addr => {
+    if (addr[0] === '!') return; // metadata keys like !ref, !margins
+    const cell = XLSX.utils.decode_cell(addr);
+    if (cell.r > maxRow) maxRow = cell.r;
+    if (cell.c > maxCol) maxCol = cell.c;
+  });
+  sheet['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: maxRow, c: maxCol } });
+}
+
+function finishLoadingRows(rows) {
+  const headerIdx = detectHeaderRow(rows);
+  window._parsedRows = rows;
+  window._headerIdx = headerIdx;
+  window._header = rows[headerIdx];
+  populateDateColumns(window._header);
+  document.getElementById('btnSplit').disabled = false;
+  setStatus(`Detected header on row ${headerIdx + 1}. Ready to split.`, 'ok');
+}
+
+// Excel's date epoch is Dec 30, 1899 (serial 0), accounting for the
+// historical leap-year bug in the format. Converts to plain M/D/YYYY
+// (or M/D/YYYY H:MM if there's a nonzero time-of-day fraction).
+function excelSerialToMDY(serial) {
+  const utcDays = Math.floor(serial - 25569); // days between 1899-12-30 and 1970-01-01
+  const dateInfo = new Date(utcDays * 86400 * 1000);
+  const timeFraction = serial - Math.floor(serial);
+  const month = dateInfo.getUTCMonth() + 1;
+  const day = dateInfo.getUTCDate();
+  const year = dateInfo.getUTCFullYear();
+  if (timeFraction > 0.0001) {
+    let totalMinutes = Math.round(timeFraction * 24 * 60);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return `${month}/${day}/${year} ${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}`;
+  }
+  return `${month}/${day}/${year}`;
 }
 
 function populateDateColumns(header) {
